@@ -491,6 +491,7 @@ def main():
             CONFIRMACION: [CallbackQueryHandler(confirmar_ejecucion)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False,
     )
 
     app.add_handler(CommandHandler("start", start))
