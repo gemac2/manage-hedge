@@ -1,5 +1,6 @@
 import os
 import asyncio
+import signal
 from decimal import Decimal
 from dotenv import load_dotenv
 from binance.client import Client
@@ -16,18 +17,18 @@ from telegram.ext import (
 
 load_dotenv()
 
-# Variables de entorno
+# Variables de Entorno
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_SECRET_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ALLOWED_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") # Para restringir el uso solo a tu usuario
+ALLOWED_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 client = Client(API_KEY, API_SECRET, tld='com')
 
-# Estados de la conversación
+# Estados de Conversación
 SYMBOL, LADO, PCT, PRECIO_INICIO, PERDIDA_MAX, CONFIRMACION = range(6)
 
-# Guardar tareas de monitoreo activas {symbol: Task}
+# Diccionario global para tareas de monitoreo {symbol: {"task": Task, "orders": [ids]}}
 MONITORING_TASKS = {}
 
 # ─── Utilidades Binance ───────────────────────────────────────────────────────
@@ -158,14 +159,18 @@ def calcular_sl(long_qty, short_qty, total_cerrar, ultimo_precio, perdida_max_us
             return None
         return ultimo_precio + (perdida_max_usd / net)
 
-# ─── Bucle de Monitoreo Asíncrono ────────────────────────────────────────────
+# ─── Bucle de Monitoreo Asíncrono Protegido ──────────────────────────────────
 
 async def monitorear_async(context: ContextTypes.DEFAULT_TYPE, symbol, order_ids, new_dist, sl_price, direction, tp_side, tp_pos_side, chat_id):
     filled = {}
     tp_order_id = None
     sl_str = f"{sl_price:.6f}" if sl_price else "N/A"
     
-    await context.bot.send_message(chat_id, f"🚀 **Monitoreo Iniciado** [{symbol}]\nSL: `{sl_str}`\nRevisando cada 10s...", parse_mode="Markdown")
+    await context.bot.send_message(
+        chat_id, 
+        f"🚀 **Monitoreo Iniciado** [{symbol}]\nSL: `{sl_str}`\nRevisando cada 10s...", 
+        parse_mode="Markdown"
+    )
 
     while True:
         await asyncio.sleep(10)
@@ -175,16 +180,43 @@ async def monitorear_async(context: ContextTypes.DEFAULT_TYPE, symbol, order_ids
             print(f"Error precio: {e}")
             continue
 
-        # Verificar SL
+        # 🛑 PROTECCIÓN 1: Validar si el usuario canceló manualmente las órdenes en Binance
+        pendientes_o_llenas = 0
+        for oid in order_ids:
+            try:
+                st = client.futures_get_order(symbol=symbol, orderId=oid)
+                if st["status"] in ["NEW", "FILLED", "PARTIALLY_FILLED"]:
+                    pendientes_o_llenas += 1
+            except Exception:
+                pass
+
+        # Si no hay órdenes ejecutadas y todas las de cierre fueron canceladas externamente
+        if len(filled) == 0 and pendientes_o_llenas == 0:
+            await context.bot.send_message(
+                chat_id,
+                f"⚠️ **Atención [{symbol}]**: Se detectó que las órdenes de cierre fueron canceladas manualmente en Binance.\n\n"
+                f"🛑 **Monitoreo cancelado automáticamente. NO se activará el Stop Loss.**",
+                parse_mode="Markdown"
+            )
+            if symbol in MONITORING_TASKS:
+                del MONITORING_TASKS[symbol]
+            return
+
+        # ── Verificar activación de SL (Solo si el monitoreo sigue válido)
         if sl_price:
             sl_hit = (direction == "down" and current_price <= sl_price) or \
                      (direction == "up"   and current_price >= sl_price)
             if sl_hit:
                 cerrar_todo(symbol)
-                await context.bot.send_message(chat_id, f"🚨 **SL Alcanzado** @ `{current_price:.6f}`. Posiciones cerradas a mercado.")
+                await context.bot.send_message(
+                    chat_id, 
+                    f"🚨 **SL Alcanzado** @ `{current_price:.6f}`. Posiciones cerradas a mercado."
+                )
+                if symbol in MONITORING_TASKS:
+                    del MONITORING_TASKS[symbol]
                 return
 
-        # Verificar ejecuciones
+        # ── Verificar ejecuciones de órdenes de cierre
         nuevas = False
         for i, oid in enumerate(order_ids):
             if i in filled:
@@ -196,29 +228,39 @@ async def monitorear_async(context: ContextTypes.DEFAULT_TYPE, symbol, order_ids
                     fq = float(st["executedQty"])
                     filled[i] = {"precio": fp, "cantidad": fq}
                     nuevas = True
-                    await context.bot.send_message(chat_id, f"✅ Orden {i+1} ejecutada: `{fq:.4f}` @ `{fp:.6f}`", parse_mode="Markdown")
+                    await context.bot.send_message(
+                        chat_id, 
+                        f"✅ Orden {i+1} ejecutada: `{fq:.4f}` @ `{fp:.6f}`", 
+                        parse_mode="Markdown"
+                    )
             except Exception as e:
                 print(f"Error orden {oid}: {e}")
 
-        # Verificar TP
+        # ── Verificar TP
         if tp_order_id:
             try:
                 tp_st = client.futures_get_order(symbol=symbol, orderId=tp_order_id)
                 if tp_st["status"] == "FILLED":
                     fp = float(tp_st["avgPrice"])
                     fq = float(tp_st["executedQty"])
-                    await context.bot.send_message(chat_id, f"🎯 **TP Ejecutado**: `{fq:.4f}` @ `{fp:.6f}`", parse_mode="Markdown")
+                    await context.bot.send_message(
+                        chat_id, 
+                        f"🎯 **TP Ejecutado**: `{fq:.4f}` @ `{fp:.6f}`", 
+                        parse_mode="Markdown"
+                    )
                     
                     pendientes = [order_ids[i] for i in range(len(order_ids)) if i not in filled]
                     for oid in pendientes:
                         cancelar_orden(symbol, oid)
                     
                     await context.bot.send_message(chat_id, "🏁 Ciclo completado con éxito.")
+                    if symbol in MONITORING_TASKS:
+                        del MONITORING_TASKS[symbol]
                     return
             except Exception as e:
                 print(f"Error TP: {e}")
 
-        # Actualizar TP
+        # ── Recalcular y actualizar TP contrario
         if nuevas:
             total_q = sum(o["cantidad"] for o in filled.values())
             avg_p   = sum(o["precio"] * o["cantidad"] for o in filled.values()) / total_q
@@ -229,10 +271,17 @@ async def monitorear_async(context: ContextTypes.DEFAULT_TYPE, symbol, order_ids
 
             res = orden_limite(symbol, tp_side, total_q, tp_price, tp_pos_side)
             tp_order_id = res["orderId"]
-            await context.bot.send_message(chat_id, f"🔄 TP Actualizado: `{total_q:.4f}` @ `{tp_price:.6f}`", parse_mode="Markdown")
+            await context.bot.send_message(
+                chat_id, 
+                f"🔄 TP Actualizado: `{total_q:.4f}` @ `{tp_price:.6f}`", 
+                parse_mode="Markdown"
+            )
 
         if len(filled) == len(order_ids):
-            await context.bot.send_message(chat_id, "ℹ️ Todas las órdenes de cierre ejecutadas. Entrando en fase final de TP/SL...")
+            await context.bot.send_message(
+                chat_id, 
+                "ℹ️ Todas las órdenes de cierre ejecutadas. Entrando en fase final de TP/SL..."
+            )
             await _fase_final_async(context, symbol, tp_order_id, sl_price, direction, chat_id)
             return
 
@@ -251,6 +300,8 @@ async def _fase_final_async(context, symbol, tp_order_id, sl_price, direction, c
             if sl_hit:
                 cerrar_todo(symbol)
                 await context.bot.send_message(chat_id, f"🚨 **SL Final alcanzado** @ `{current_price:.6f}`.")
+                if symbol in MONITORING_TASKS:
+                    del MONITORING_TASKS[symbol]
                 return
 
         if tp_order_id:
@@ -260,6 +311,8 @@ async def _fase_final_async(context, symbol, tp_order_id, sl_price, direction, c
                     pos_long, pos_short = obtener_posiciones(symbol)
                     if not pos_long and not pos_short:
                         await context.bot.send_message(chat_id, "🎯 **TP Final ejecutado**. Sin posiciones abiertas. Fin.")
+                        if symbol in MONITORING_TASKS:
+                            del MONITORING_TASKS[symbol]
                         return
                     tp_order_id = None
             except Exception as e:
@@ -275,7 +328,11 @@ async def auth_filter(update: Update):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await auth_filter(update): return ConversationHandler.END
-    await update.message.reply_text("🤖 **Bot de Cobertura Binance Futures**\n\nEnvía /cobertura para iniciar la gestión.")
+    msg = ("🤖 **Bot de Cobertura Binance Futures**\n\n"
+           "• `/cobertura` - Iniciar gestión de cobertura\n"
+           "• `/abortar SÍMBOLO` - Cancelar órdenes y detener monitoreo\n"
+           "• `/cancel` - Cancelar menú interactivo")
+    await update.message.reply_text(msg, parse_mode="Markdown")
     return ConversationHandler.END
 
 async def iniciar_cobertura(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -288,7 +345,10 @@ async def recibir_simbolo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         pos_long, pos_short = obtener_posiciones(symbol)
         if not pos_long or not pos_short:
-            await update.message.reply_text(f"❌ No se detecta cobertura en `{symbol}`. Se requieren posiciones LONG y SHORT abiertas.", parse_mode="Markdown")
+            await update.message.reply_text(
+                f"❌ No se detecta cobertura en `{symbol}`. Se requieren posiciones LONG y SHORT abiertas.", 
+                parse_mode="Markdown"
+            )
             return ConversationHandler.END
         
         context.user_data['symbol'] = symbol
@@ -320,7 +380,11 @@ async def recibir_lado(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("5 %", callback_data="5"), InlineKeyboardButton("10 %", callback_data="10")]
     ]
-    await query.edit_message_text(f"Seleccionaste cerrar **{lado.upper()}**.\nPorcentaje de monedas a cerrar:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    await query.edit_message_text(
+        f"Seleccionaste cerrar **{lado.upper()}**.\nPorcentaje de monedas a cerrar:", 
+        reply_markup=InlineKeyboardMarkup(keyboard), 
+        parse_mode="Markdown"
+    )
     return PCT
 
 async def recibir_pct(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -339,7 +403,8 @@ async def recibir_pct(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text(
         f"Distancia cobertura: `{hedge_dist:.2f}%` → Distancia órdenes ({mult_distancia}x): `{new_dist:.2f}%`\n\n"
-        f"Ingresa el **Precio de inicio de cierre**:", parse_mode="Markdown"
+        f"Ingresa el **Precio de inicio de cierre**:", 
+        parse_mode="Markdown"
     )
     return PRECIO_INICIO
 
@@ -351,7 +416,8 @@ async def recibir_precio_inicio(update: Update, context: ContextTypes.DEFAULT_TY
         wallet = get_wallet_balance()
         await update.message.reply_text(
             f"Balance wallet disponible: `{wallet:.2f} USDT`\n\n"
-            f"Ingresa la **Pérdida máxima en USD** a arriesgar en SL (ej. 15):", parse_mode="Markdown"
+            f"Ingresa la **Pérdida máxima en USD** a arriesgar en SL (ej. 15):", 
+            parse_mode="Markdown"
         )
         return PERDIDA_MAX
     except ValueError:
@@ -439,8 +505,8 @@ async def confirmar_ejecucion(update: Update, context: ContextTypes.DEFAULT_TYPE
             order_ids.append(res["orderId"])
 
         # Cancelar tarea previa si existe para ese par
-        if symbol in MONITORING_TASKS and not MONITORING_TASKS[symbol].done():
-            MONITORING_TASKS[symbol].cancel()
+        if symbol in MONITORING_TASKS:
+            MONITORING_TASKS[symbol]["task"].cancel()
 
         # Iniciar tarea asíncrona de monitoreo
         task = asyncio.create_task(
@@ -449,33 +515,60 @@ async def confirmar_ejecucion(update: Update, context: ContextTypes.DEFAULT_TYPE
                 sl_price, direction, tp_side, tp_pos_side, query.message.chat_id
             )
         )
-        MONITORING_TASKS[symbol] = task
+        MONITORING_TASKS[symbol] = {"task": task, "orders": order_ids}
 
-        await context.bot.send_message(query.message.chat_id, "✅ Órdenes colocadas. Monitoreo en segundo plano activado.")
+        await context.bot.send_message(
+            query.message.chat_id, 
+            "✅ Órdenes colocadas. Monitoreo activado.\nSi deseas detenerlo usa `/abortar " + symbol + "`"
+        )
 
     except Exception as e:
         await context.bot.send_message(query.message.chat_id, f"❌ Error ejecutando órdenes: {e}")
 
     return ConversationHandler.END
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Operación cancelada.")
-    return ConversationHandler.END
-
-async def cancelar_monitoreo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# 🛑 COMANDO NUEVO: Abortar monitoreo y cancelar órdenes pendientes en Binance
+async def abortar_cobertura(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await auth_filter(update): return
     if not context.args:
-        await update.message.reply_text("Uso: `/cancelar_monitoreo SÍMBOLO` (Ej: `/cancelar_monitoreo BTCUSDT`)", parse_mode="Markdown")
+        await update.message.reply_text("Uso: `/abortar SÍMBOLO` (Ej: `/abortar BTCUSDT`)", parse_mode="Markdown")
         return
-    
-    symbol = context.args[0].upper()
-    if symbol in MONITORING_TASKS and not MONITORING_TASKS[symbol].done():
-        MONITORING_TASKS[symbol].cancel()
-        await update.message.reply_text(f"🛑 Monitoreo para `{symbol}` detenido.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text(f"No hay monitoreo activo registrado para `{symbol}`.", parse_mode="Markdown")
 
-# ─── Inicialización de la App Telegram ───────────────────────────────────────
+    symbol = context.args[0].upper()
+    
+    # 1. Cancelar la tarea asíncrona en Railway
+    if symbol in MONITORING_TASKS:
+        MONITORING_TASKS[symbol]["task"].cancel()
+        del MONITORING_TASKS[symbol]
+
+    # 2. Cancelar todas las órdenes abiertas en Binance
+    try:
+        client.futures_cancel_all_open_orders(symbol=symbol)
+        await update.message.reply_text(
+            f"🛑 **Monitoreo cancelado y órdenes eliminadas** en Binance para `{symbol}`.\n"
+            f"Tus posiciones quedan intactas.", 
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Se detuvo el monitoreo local, pero ocurrió un error cancelando en Binance: {e}")
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Si hay un símbolo en user_data, verificar si se quiere cancelar la cobertura activa
+    symbol = context.user_data.get('symbol')
+    if symbol and symbol in MONITORING_TASKS:
+        MONITORING_TASKS[symbol]["task"].cancel()
+        del MONITORING_TASKS[symbol]
+        try:
+            client.futures_cancel_all_open_orders(symbol=symbol)
+            await update.message.reply_text(f"🛑 Monitoreo cancelado y órdenes eliminadas en Binance para `{symbol}`.", parse_mode="Markdown")
+            return ConversationHandler.END
+        except Exception:
+            pass
+
+    await update.message.reply_text("Operación o menú cancelado.")
+    return ConversationHandler.END
+
+# ─── Inicialización de la Aplicación ──────────────────────────────────────────
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -490,16 +583,24 @@ def main():
             PERDIDA_MAX: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_perdida_max)],
             CONFIRMACION: [CallbackQueryHandler(confirmar_ejecucion)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("abortar", abortar_cobertura)
+        ],
         per_message=False,
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("cancelar_monitoreo", cancelar_monitoreo))
+    app.add_handler(CommandHandler("abortar", abortar_cobertura))
     app.add_handler(conv_handler)
 
-    print("Bot activo y listo...")
-    app.run_polling()
+    print("Iniciando Bot de Cobertura Protegido...")
+
+    app.run_polling(
+        drop_pending_updates=True,
+        close_loop=True,
+        stop_signals=(signal.SIGTERM, signal.SIGINT, signal.SIGABRT)
+    )
 
 if __name__ == "__main__":
     main()
