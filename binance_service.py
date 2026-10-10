@@ -122,10 +122,37 @@ def _sync_create_market_order(symbol: str, side: str, qty: float, pos_side: str)
     }
     return binance_client.futures_create_order(**params)
 
+def _sync_cancel_conflicting_sl_orders(symbol: str, pos_side: str):
+    """
+    Cancela órdenes abiertas condicionales previas (STOP_MARKET, TAKE_PROFIT_MARKET, STOP)
+    o con closePosition=True para el mismo positionSide.
+    Esto previene el error Binance -4130:
+    'An open stop or take profit order with GTE and closePosition in the direction is existing.'
+    """
+    try:
+        open_orders = binance_client.futures_get_open_orders(symbol=symbol)
+        for o in open_orders:
+            if o.get("positionSide") == pos_side:
+                is_close_pos = o.get("closePosition") is True or str(o.get("closePosition")).lower() == "true"
+                is_stop_type = o.get("type") in ["STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET", "TAKE_PROFIT"]
+                if is_close_pos or is_stop_type:
+                    logger.warning(
+                        f"Cancelando orden previa conflictiva {o['orderId']} ({o.get('type')}) en {symbol} [{pos_side}] "
+                        f"para liberar slot closePosition y evitar error -4130."
+                    )
+                    try:
+                        binance_client.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
+                    except Exception as ce:
+                        logger.warning(f"Aviso cancelando orden previa conflictiva {o['orderId']}: {ce}")
+    except Exception as e:
+        logger.warning(f"Error verificando órdenes abiertas en {symbol}: {e}")
+
 def _sync_create_sl_market_order(symbol: str, side: str, pos_side: str, stop_price: float):
     """
     Coloca una orden nativa STOP_MARKET en Binance con closePosition=True.
     Garantiza ejecución inmediata a nivel del motor de emparejamiento de Binance sin latencia.
+    Si Binance arroja APIError(-4130), automáticamente cancela cualquier orden condicional previa
+    en esa dirección y reintenta la colocación.
     """
     filters = binance_cache.get_filters(symbol)
     if not filters:
@@ -140,7 +167,20 @@ def _sync_create_sl_market_order(symbol: str, side: str, pos_side: str, stop_pri
         "stopPrice": formatted_stop,
         "closePosition": "true",
     }
-    return binance_client.futures_create_order(**params)
+
+    try:
+        return binance_client.futures_create_order(**params)
+    except Exception as e:
+        err_msg = str(e)
+        if "-4130" in err_msg or "closePosition in the direction is existing" in err_msg:
+            logger.warning(
+                f"Error -4130 detectado al armar SL nativo en {symbol} [{pos_side}]. "
+                f"Limpiando órdenes stop previas conflictivas y reintentando..."
+            )
+            _sync_cancel_conflicting_sl_orders(symbol, pos_side)
+            # Reintento directo tras liberar el slot en Binance
+            return binance_client.futures_create_order(**params)
+        raise
 
 def _sync_cancel_order(symbol: str, order_id: int):
     try:
@@ -189,8 +229,14 @@ async def async_create_market_order(symbol: str, side: str, qty: float, pos_side
 async def async_create_sl_market_order(symbol: str, side: str, pos_side: str, stop_price: float):
     return await asyncio.to_thread(_sync_create_sl_market_order, symbol, side, pos_side, stop_price)
 
+async def async_cancel_conflicting_sl_orders(symbol: str, pos_side: str):
+    return await asyncio.to_thread(_sync_cancel_conflicting_sl_orders, symbol, pos_side)
+
 async def async_cancel_order(symbol: str, order_id: int):
     return await asyncio.to_thread(_sync_cancel_order, symbol, order_id)
+
+# Alias para compatibilidad de nomenclatura
+async_cancelar_orden = async_cancel_order
 
 async def async_close_all_positions(symbol: str):
     return await asyncio.to_thread(_sync_close_all_positions, symbol)

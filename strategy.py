@@ -4,14 +4,14 @@ def round_price(price: float | Decimal, tick_size: Decimal) -> str:
     """Ajusta y redondea un precio al múltiplo exacto de tickSize de Binance."""
     p = Decimal(str(price))
     p_rounded = (p // tick_size) * tick_size
-    dec = abs(tick_size.as_tuple().exponent)
+    dec = max(0, -tick_size.as_tuple().exponent)
     return f"{p_rounded:.{dec}f}"
 
 def round_quantity(qty: float | Decimal, step_size: Decimal) -> str:
     """Ajusta y redondea una cantidad al múltiplo exacto de stepSize de Binance."""
     q = Decimal(str(qty))
     q_rounded = (q // step_size) * step_size
-    dec = abs(step_size.as_tuple().exponent)
+    dec = max(0, -step_size.as_tuple().exponent)
     return f"{q_rounded:.{dec}f}"
 
 def validate_notional(qty: float, price: float, min_notional: Decimal) -> bool:
@@ -40,6 +40,7 @@ def calcular_ordenes(start_price: float, initial_qty: float, new_dist: float, di
 def calcular_sl(long_qty: float, short_qty: float, total_cerrar: float, ultimo_precio: float, perdida_max_usd: float, direction: str):
     """
     Calcula el precio del Stop Loss para limitar la pérdida máxima en dólares (USD).
+    Retorna None si la pérdida máxima no es positiva o el precio resultante no es válido (>0).
     """
     if perdida_max_usd <= 0:
         return None
@@ -47,9 +48,11 @@ def calcular_sl(long_qty: float, short_qty: float, total_cerrar: float, ultimo_p
         net = long_qty - (short_qty - total_cerrar)
         if net <= 0:
             return None
-        return ultimo_precio - (perdida_max_usd / net)
+        res = ultimo_precio - (perdida_max_usd / net)
+        return res if res > 0 else None
     else:
         net = short_qty - (long_qty - total_cerrar)
         if net <= 0:
             return None
-        return ultimo_precio + (perdida_max_usd / net)
+        res = ultimo_precio + (perdida_max_usd / net)
+        return res if res > 0 else None

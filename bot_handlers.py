@@ -26,6 +26,7 @@ from binance_service import (
     async_get_order,
     async_create_limit_order,
     async_create_sl_market_order,
+    async_cancel_conflicting_sl_orders,
     async_cancel_order,
     async_close_all_positions,
 )
@@ -86,6 +87,7 @@ async def monitorear_async(
     filled = {}
     tp_order_id = initial_tp_id
     sl_order_id = initial_sl_id
+    sl_error_count = 0
 
     # Si direction == "down" (cerrando SHORT), el riesgo de caída es de LONG -> SL vende LONG
     # Si direction == "up" (cerrando LONG), el riesgo de subida es de SHORT -> SL compra SHORT
@@ -104,17 +106,37 @@ async def monitorear_async(
             logger.warning(f"Error consultando precio para {symbol}: {e}")
             continue
 
-        # 🛑 PROTECCIÓN 1: Validar si el usuario canceló manualmente las órdenes en Binance
-        pendientes_o_llenas = 0
-        for oid in order_ids:
+        # 🛑 PROTECCIÓN 1 y VERIFICACIÓN DE ÓRDENES EN UN SOLO PASE
+        nuevas = False
+        pendientes = 0
+        errores_consulta = 0
+
+        for i, oid in enumerate(order_ids):
+            if i in filled:
+                continue
             try:
                 st = await async_get_order(symbol, oid)
-                if st["status"] in ["NEW", "FILLED", "PARTIALLY_FILLED"]:
-                    pendientes_o_llenas += 1
-            except Exception:
-                pass
+                status = st.get("status")
+                if status == "FILLED":
+                    fp = float(st.get("avgPrice") or st.get("price", 0))
+                    fq = float(st.get("executedQty", 0))
+                    filled[i] = {"precio": fp, "cantidad": fq}
+                    nuevas = True
+                    await safe_send(
+                        bot,
+                        chat_id,
+                        f"✅ Orden {i+1} ejecutada: `{fq:.4f}` @ `{fp:.6f}`",
+                        parse_mode="Markdown"
+                    )
+                elif status in ["NEW", "PARTIALLY_FILLED"]:
+                    pendientes += 1
+            except Exception as e:
+                logger.warning(f"Error consultando orden {oid} en {symbol}: {e}")
+                errores_consulta += 1
 
-        if len(filled) == 0 and pendientes_o_llenas == 0:
+        # Si no hay órdenes ejecutadas, no quedan pendientes y no hubo errores de red/API,
+        # significa que fueron canceladas externamente por el usuario en Binance.
+        if len(filled) == 0 and pendientes == 0 and errores_consulta == 0:
             await safe_send(
                 bot,
                 chat_id,
@@ -127,19 +149,20 @@ async def monitorear_async(
                 del MONITORING_TASKS[symbol]
             return
 
-        # 🛑 PROTECCIÓN 2: Verificar si el Stop Loss Nativo en Binance fue ejecutado
+        # 🛑 PROTECCIÓN 2: Verificar si el Stop Loss Nativo en Binance fue ejecutado o cancelado
         if sl_order_id:
             try:
                 sl_st = await async_get_order(symbol, sl_order_id)
-                if sl_st["status"] in ["FILLED", "EXPIRED"]:
+                sl_status = sl_st.get("status")
+                if sl_status in ["FILLED", "EXPIRED"]:
                     logger.warning(f"Stop Loss nativo ejecutado en Binance para {symbol}")
                     
                     # Cancelar órdenes pendientes de la grilla
-                    pendientes = [order_ids[i] for i in range(len(order_ids)) if i not in filled]
-                    for oid in pendientes:
-                        await async_cancelar_orden(symbol, oid)
+                    pendientes_oids = [order_ids[i] for i in range(len(order_ids)) if i not in filled]
+                    for oid in pendientes_oids:
+                        await async_cancel_order(symbol, oid)
                     if tp_order_id:
-                        await async_cancelar_orden(symbol, tp_order_id)
+                        await async_cancel_order(symbol, tp_order_id)
 
                     # Salir de la posición residual para cerrar el hedge completamente
                     await async_close_all_positions(symbol)
@@ -157,37 +180,22 @@ async def monitorear_async(
                     if symbol in MONITORING_TASKS:
                         del MONITORING_TASKS[symbol]
                     return
+                elif sl_status in ["CANCELED", "REJECTED"]:
+                    logger.warning(f"Stop Loss nativo {sl_order_id} cancelado externamente en Binance para {symbol}. Se rearmará.")
+                    sl_order_id = None
+                    update_hedge_orders(symbol, sl_order_id=None)
+                    if symbol in MONITORING_TASKS:
+                        MONITORING_TASKS[symbol]["sl_order_id"] = None
             except Exception as e:
                 logger.error(f"Error verificando estado de SL {sl_order_id}: {e}")
-
-        # ── Verificar estado de órdenes de la grilla
-        nuevas = False
-        for i, oid in enumerate(order_ids):
-            if i in filled:
-                continue
-            try:
-                st = await async_get_order(symbol, oid)
-                if st["status"] == "FILLED":
-                    fp = float(st["avgPrice"])
-                    fq = float(st["executedQty"])
-                    filled[i] = {"precio": fp, "cantidad": fq}
-                    nuevas = True
-                    await safe_send(
-                        bot,
-                        chat_id,
-                        f"✅ Orden {i+1} ejecutada: `{fq:.4f}` @ `{fp:.6f}`",
-                        parse_mode="Markdown"
-                    )
-            except Exception as e:
-                logger.error(f"Error consultando orden {oid}: {e}")
 
         # ── Verificar si el Take Profit (TP) fue ejecutado
         if tp_order_id:
             try:
                 tp_st = await async_get_order(symbol, tp_order_id)
-                if tp_st["status"] == "FILLED":
-                    fp = float(tp_st["avgPrice"])
-                    fq = float(tp_st["executedQty"])
+                if tp_st.get("status") == "FILLED":
+                    fp = float(tp_st.get("avgPrice") or tp_st.get("price", 0))
+                    fq = float(tp_st.get("executedQty", 0))
                     await safe_send(
                         bot,
                         chat_id,
@@ -196,13 +204,13 @@ async def monitorear_async(
                     )
 
                     # Cancelar órdenes pendientes de la grilla
-                    pendientes = [order_ids[i] for i in range(len(order_ids)) if i not in filled]
-                    for oid in pendientes:
-                        await async_cancelar_orden(symbol, oid)
+                    pendientes_oids = [order_ids[i] for i in range(len(order_ids)) if i not in filled]
+                    for oid in pendientes_oids:
+                        await async_cancel_order(symbol, oid)
 
                     # Cancelar el Stop Loss nativo en Binance
                     if sl_order_id:
-                        await async_cancelar_orden(symbol, sl_order_id)
+                        await async_cancel_order(symbol, sl_order_id)
 
                     mark_hedge_status(symbol, "COMPLETED")
                     await safe_send(
@@ -216,44 +224,49 @@ async def monitorear_async(
             except Exception as e:
                 logger.error(f"Error consultando TP {tp_order_id}: {e}")
 
-        # ── ACCIÓN INMEDIATA TRAS EJECUCIÓN DE ÓRDENES ─────────────────────────
-        if nuevas:
-            # 🛡️ REGLA PRINCIPAL: Colocar STOP LOSS Nativo en Binance apenas toque la 1ra orden
-            if sl_price and sl_order_id is None:
-                try:
-                    logger.info(f"Colocando STOP_MARKET nativo en Binance para {symbol} @ {sl_price}")
-                    sl_res = await async_create_sl_market_order(symbol, sl_side, sl_pos_side, sl_price)
-                    sl_order_id = sl_res["orderId"]
-                    update_hedge_orders(symbol, sl_order_id=sl_order_id)
-                    if symbol in MONITORING_TASKS:
-                        MONITORING_TASKS[symbol]["sl_order_id"] = sl_order_id
+        # 🛡️ REGLA PRINCIPAL: Asegurar STOP LOSS Nativo en Binance apenas haya al menos 1 orden ejecutada
+        # Se ejecuta de forma persistente hasta tener un sl_order_id activo
+        if len(filled) > 0 and sl_price and sl_order_id is None:
+            try:
+                logger.info(f"Colocando STOP_MARKET nativo en Binance para {symbol} @ {sl_price}")
+                sl_res = await async_create_sl_market_order(symbol, sl_side, sl_pos_side, sl_price)
+                sl_order_id = sl_res["orderId"]
+                sl_error_count = 0
+                update_hedge_orders(symbol, sl_order_id=sl_order_id)
+                if symbol in MONITORING_TASKS:
+                    MONITORING_TASKS[symbol]["sl_order_id"] = sl_order_id
 
+                await safe_send(
+                    bot,
+                    chat_id,
+                    f"🛡️ **STOP LOSS NATIVO ARMADO EN BINANCE**\n"
+                    f"• Símbolo: `{symbol}`\n"
+                    f"• Posición protegida: `{sl_pos_side}`\n"
+                    f"• Tipo: `STOP_MARKET` ({sl_side})\n"
+                    f"• Gatillo: `{sl_price:.6f}`\n"
+                    f"• *Si la volatilidad sacude el mercado, Binance ejecuta el cierre sin latencia.*",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                sl_error_count += 1
+                logger.critical(f"Error al colocar Stop Loss nativo en Binance ({symbol}, intento #{sl_error_count}): {e}")
+                # Notificar en el primer fallo y luego espaciar cada ~1 minuto (12 ciclos de 5s) para no spamear
+                if sl_error_count == 1 or sl_error_count % 12 == 0:
                     await safe_send(
                         bot,
                         chat_id,
-                        f"🛡️ **STOP LOSS NATIVO ARMADO EN BINANCE**\n"
-                        f"• Símbolo: `{symbol}`\n"
-                        f"• Posición protegida: `{sl_pos_side}`\n"
-                        f"• Tipo: `STOP_MARKET` ({sl_side})\n"
-                        f"• Gatillo: `{sl_price:.6f}`\n"
-                        f"• *Si la volatilidad sacude el mercado, Binance ejecuta el cierre sin latencia.*",
-                        parse_mode="Markdown"
-                    )
-                except Exception as e:
-                    logger.critical(f"Error al colocar Stop Loss nativo en Binance: {e}")
-                    await safe_send(
-                        bot,
-                        chat_id,
-                        f"⚠️ **Error al armar SL nativo en Binance**: {e}\nSe mantendrá intento en la siguiente ronda."
+                        f"⚠️ **Error al armar SL nativo en Binance**: {e}\n"
+                        f"Se continuará reintentando automáticamente en segundo plano en cada ronda."
                     )
 
-            # ── Recalcular y colocar TP promedio en Binance
+        # ── Recalcular y colocar TP promedio en Binance al ejecutarse nuevas órdenes
+        if nuevas or (len(filled) > 0 and tp_order_id is None):
             total_q = sum(o["cantidad"] for o in filled.values())
             avg_p   = sum(o["precio"] * o["cantidad"] for o in filled.values()) / total_q
             tp_price = avg_p * (1 + new_dist/100) if direction == "down" else avg_p * (1 - new_dist/100)
 
             if tp_order_id:
-                await async_cancelar_orden(symbol, tp_order_id)
+                await async_cancel_order(symbol, tp_order_id)
 
             try:
                 res = await async_create_limit_order(symbol, tp_side, total_q, tp_price, tp_pos_side)
@@ -310,21 +323,30 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await auth_filter(update): return
     active_in_db = get_active_hedges()
 
-    if not active_in_db and not MONITORING_TASKS:
+    active_symbols = list({h['symbol'] for h in active_in_db} | set(MONITORING_TASKS.keys()))
+    if not active_symbols:
         await update.message.reply_text("ℹ️ No hay coberturas activas bajo monitoreo en este momento.")
         return
 
     report = "📊 **ESTADO DE COBERTURAS ACTIVAS**\n\n"
-    for h in active_in_db:
-        sym = h['symbol']
-        sl_str = f"{h['sl_price']:.6f}" if h['sl_price'] else "N/A"
-        sl_activo = "✅ Colocado en Binance" if h['sl_order_id'] else "⏳ En espera de 1ra orden"
-        tp_activo = f"✅ Orden #{h['tp_order_id']}" if h['tp_order_id'] else "⏳ En espera"
+    for sym in active_symbols:
+        h = get_hedge(sym) or {}
+        mem = MONITORING_TASKS.get(sym, {})
+
+        sl_price = h.get('sl_price')
+        sl_str = f"{sl_price:.6f}" if sl_price else "N/A"
+        sl_id = mem.get('sl_order_id') or h.get('sl_order_id')
+        tp_id = mem.get('tp_order_id') or h.get('tp_order_id')
+
+        sl_activo = f"✅ En Binance (#{sl_id})" if sl_id else "⏳ En espera de 1ra orden"
+        tp_activo = f"✅ Orden #{tp_id}" if tp_id else "⏳ En espera"
+        lado = str(h.get('lado') or mem.get('lado') or 'N/A').upper()
+        order_count = len(h.get('order_ids') or mem.get('orders') or [])
 
         report += (
             f"🔹 **{sym}**\n"
-            f"• Lado: Cierre de `{h['lado'].upper()}`\n"
-            f"• Órdenes grilla: `{len(h['order_ids'])}` órdenes\n"
+            f"• Lado: Cierre de `{lado}`\n"
+            f"• Órdenes grilla: `{order_count}` órdenes\n"
             f"• Stop Loss: `{sl_str}` ({sl_activo})\n"
             f"• Take Profit: {tp_activo}\n"
             f"• Cancelar: `/abortar {sym}`\n\n"
@@ -345,10 +367,14 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     for p in positions:
         pnl = p['unrealizedProfit']
         emoji_pnl = "🟢" if pnl >= 0 else "🔴"
+        ep = p['entryPrice']
+        mp = p['markPrice']
+        ep_str = f"{ep:.6g}" if ep < 1 else f"{ep:.4f}"
+        mp_str = f"{mp:.6g}" if mp < 1 else f"{mp:.4f}"
         msg += (
             f"• **{p['symbol']}** ({p['side']} {p['leverage']}x)\n"
-            f"  Cantidad: `{p['amount']}` | Entrada: `{p['entryPrice']:.4f}`\n"
-            f"  Mark: `{p['markPrice']:.4f}` | PnL: {emoji_pnl} `{pnl:+.2f} USDT`\n\n"
+            f"  Cantidad: `{p['amount']}` | Entrada: `{ep_str}`\n"
+            f"  Mark: `{mp_str}` | PnL: {emoji_pnl} `{pnl:+.2f} USDT`\n\n"
         )
 
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -531,20 +557,41 @@ async def confirmar_ejecucion(update: Update, context: ContextTypes.DEFAULT_TYPE
     sl_price = context.user_data['sl_price']
     direction = context.user_data['direction']
 
-    close_side     = "BUY"  if lado == "short" else "SELL"
+    close_side     = "BUY"   if lado == "short" else "SELL"
     close_pos_side = "SHORT" if lado == "short" else "LONG"
-    tp_side        = "SELL" if lado == "short" else "BUY"
-    tp_pos_side    = "LONG" if lado == "short" else "SHORT"
+    tp_side        = "SELL"  if lado == "short" else "BUY"
+    tp_pos_side    = "LONG"  if lado == "short" else "SHORT"
+    sl_pos_side    = "LONG"  if direction == "down" else "SHORT"
+
+    # Limpiar cualquier cobertura previa en Binance y memoria para este símbolo antes de colocar nuevas
+    if symbol in MONITORING_TASKS:
+        prev_task = MONITORING_TASKS[symbol]
+        prev_task["task"].cancel()
+        del MONITORING_TASKS[symbol]
+        for oid in prev_task.get("orders", []):
+            await async_cancel_order(symbol, oid)
+        if prev_task.get("tp_order_id"):
+            await async_cancel_order(symbol, prev_task["tp_order_id"])
+        if prev_task.get("sl_order_id"):
+            await async_cancel_order(symbol, prev_task["sl_order_id"])
+
+    prev_hedge = get_hedge(symbol)
+    if prev_hedge:
+        for oid in prev_hedge.get("order_ids", []):
+            await async_cancel_order(symbol, oid)
+        if prev_hedge.get("tp_order_id"):
+            await async_cancel_order(symbol, prev_hedge["tp_order_id"])
+        if prev_hedge.get("sl_order_id"):
+            await async_cancel_order(symbol, prev_hedge["sl_order_id"])
+
+    # Limpiar órdenes stop condicionales previas para evitar error Binance -4130
+    await async_cancel_conflicting_sl_orders(symbol, sl_pos_side)
 
     order_ids = []
     try:
         for o in orders:
             res = await async_create_limit_order(symbol, close_side, o["cantidad"], o["precio"], close_pos_side)
             order_ids.append(res["orderId"])
-
-        # Cancelar tarea previa si existía en memoria
-        if symbol in MONITORING_TASKS:
-            MONITORING_TASKS[symbol]["task"].cancel()
 
         # Guardar estado de cobertura en SQLite para persistencia ante reinicios
         save_hedge(
@@ -571,7 +618,8 @@ async def confirmar_ejecucion(update: Update, context: ContextTypes.DEFAULT_TYPE
             "orders": order_ids,
             "tp_order_id": None,
             "sl_order_id": None,
-            "chat_id": query.message.chat_id
+            "chat_id": query.message.chat_id,
+            "lado": lado
         }
 
         await safe_send(
@@ -598,43 +646,52 @@ async def abortar_cobertura(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = context.args[0].upper()
 
     # Cancelar tarea en memoria si está activa
-    if symbol in MONITORING_TASKS:
-        MONITORING_TASKS[symbol]["task"].cancel()
+    task_info = MONITORING_TASKS.get(symbol)
+    if task_info:
+        task_info["task"].cancel()
         del MONITORING_TASKS[symbol]
 
     # Obtener registro de persistencia
     hedge_data = get_hedge(symbol)
     canceladas = 0
 
-    if hedge_data:
-        # Cancelar únicamente las órdenes específicas creadas para esta cobertura
-        for oid in hedge_data.get("order_ids", []):
-            res = await async_cancel_order(symbol, oid)
-            if res: canceladas += 1
-        if hedge_data.get("tp_order_id"):
-            res = await async_cancel_order(symbol, hedge_data["tp_order_id"])
-            if res: canceladas += 1
-        if hedge_data.get("sl_order_id"):
-            res = await async_cancel_order(symbol, hedge_data["sl_order_id"])
-            if res: canceladas += 1
+    order_ids_to_cancel = set()
+    if task_info:
+        for oid in task_info.get("orders", []):
+            order_ids_to_cancel.add(oid)
+        if task_info.get("tp_order_id"):
+            order_ids_to_cancel.add(task_info["tp_order_id"])
+        if task_info.get("sl_order_id"):
+            order_ids_to_cancel.add(task_info["sl_order_id"])
 
+    if hedge_data:
+        for oid in hedge_data.get("order_ids", []):
+            order_ids_to_cancel.add(oid)
+        if hedge_data.get("tp_order_id"):
+            order_ids_to_cancel.add(hedge_data["tp_order_id"])
+        if hedge_data.get("sl_order_id"):
+            order_ids_to_cancel.add(hedge_data["sl_order_id"])
+
+    for oid in order_ids_to_cancel:
+        res = await async_cancel_order(symbol, oid)
+        if res:
+            canceladas += 1
+
+    # Limpiar preventivamente cualquier orden condicional previa de SL en Binance
+    await async_cancel_conflicting_sl_orders(symbol, "LONG")
+    await async_cancel_conflicting_sl_orders(symbol, "SHORT")
+
+    if hedge_data:
         mark_hedge_status(symbol, "ABORTED")
-        await update.message.reply_text(
-            f"🛑 **Monitoreo detenido y {canceladas} órdenes de cobertura eliminadas en Binance** para `{symbol}`.\n"
-            f"Tus posiciones quedan intactas.",
-            parse_mode="Markdown"
-        )
-    else:
-        await update.message.reply_text(
-            f"⚠️ No se encontró registro de cobertura activa para `{symbol}`.",
-            parse_mode="Markdown"
-        )
+
+    await update.message.reply_text(
+        f"🛑 **Monitoreo detenido y {canceladas} órdenes de cobertura eliminadas en Binance** para `{symbol}`.\n"
+        f"Tus posiciones quedan intactas.",
+        parse_mode="Markdown"
+    )
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    symbol = context.user_data.get('symbol')
-    if symbol and symbol in MONITORING_TASKS:
-        await abortar_cobertura(update, context)
-        return ConversationHandler.END
-
+    if not await auth_filter(update): return ConversationHandler.END
+    context.user_data.clear()
     await update.message.reply_text("Operación o menú interactivo cancelado.")
     return ConversationHandler.END
